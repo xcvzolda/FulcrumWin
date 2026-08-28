@@ -21,6 +21,7 @@
 #include "BitcoinD.h"
 #include "BTC.h"
 #include "BlockProc.h"
+#include "HeaderConsistencyChecker.h"
 #include "Mixins.h"
 #include "Options.h"
 #include "Storage.h"
@@ -188,12 +189,26 @@ private:
     std::shared_ptr<BitcoinDMgr> bitcoindmgr; ///< shared with srvmgr, but we control its lifecycle
     std::unique_ptr<SrvMgr> srvmgr; ///< NB: this may be nullptr if we haven't yet synched up and started listening.  Additionally, this should be destructed before storage or bitcoindmgr.
 
+    /// Runs once, after the first successful bitcoind connection and before we proceed to normal sync/serving.
+    /// Verifies our on-disk headers against bitcoind via batched RPC. See HeaderConsistencyChecker.h. Non-null only
+    /// while a check is actively in-flight.
+    std::unique_ptr<HeaderConsistencyChecker> headerConsistencyChecker;
+    /// Latched to true once we've run (or given up on) the header consistency check, so we don't repeat it on every
+    /// subsequent bitcoind reconnect -- only once per process lifetime.
+    bool headersVerifiedAgainstDaemon = false;
+
     struct StateMachine;
     std::unique_ptr<StateMachine> sm;
     mutable std::shared_mutex smLock;
 
     std::unordered_map<CtlTask *, std::unique_ptr<CtlTask>, Util::PtrHasher> tasks;
     int nDLBlocksTasks = 0;
+
+    /// Called once by the HeaderConsistencyChecker completion callback if it found our stored headers diverge from
+    /// bitcoind's at `mismatchHeight`. Rewinds via storage->undoLatestBlock() if the divergence is within our undo
+    /// depth (a normal reorg that happened while we were offline); otherwise logs Fatal() and asks for a full resync,
+    /// since a mismatch deeper than our undo depth indicates local database corruption, not a real reorg.
+    void onHeaderMismatchDetected(unsigned mismatchHeight);
 
     CtlTask * add_DLBlocksTask(unsigned from, unsigned to, size_t nTasks, bool isRpaOnlyMode);
     void process_DownloadingBlocks();

@@ -361,6 +361,7 @@ SOURCES += \
     Controller/SynchMempoolTask.cpp \
     CoTask.cpp \
     DSProof.cpp \
+    HeaderConsistencyChecker.cpp \
     Json/Json.cpp \
     Json/Json_Parser.cpp \
     Json/tests.cpp \
@@ -416,6 +417,7 @@ HEADERS += \
     CostCache.h \
     CoTask.h \
     DSProof.h \
+    HeaderConsistencyChecker.h \
     Json/Json.h \
     Logger.h \
     Mempool.h \

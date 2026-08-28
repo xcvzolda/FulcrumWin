@@ -102,7 +102,7 @@ void Controller::startup()
 
     bitcoindmgr = std::make_shared<BitcoinDMgr>(options->bdNClients, options->bdRPCInfo);
     {
-        auto constexpr waitTimer = "wait4bitcoind", callProcessTimer = "callProcess";
+        auto constexpr waitTimer = "wait4yentend", callProcessTimer = "callProcess";
         int constexpr msgPeriod = 10000, // 10sec
                       smallDelay = 100;
 
@@ -111,7 +111,7 @@ void Controller::startup()
             lostConn = true;
             stopTimer(pollTimerName);
             stopTimer(callProcessTimer);
-            callOnTimerSoon(msgPeriod, waitTimer, []{ Log("Waiting for bitcoind..."); return true; }, false, Qt::TimerType::VeryCoarseTimer);
+            callOnTimerSoon(msgPeriod, waitTimer, []{ Log("Waiting for yentend..."); return true; }, false, Qt::TimerType::VeryCoarseTimer);
         };
         waitForBitcoinD();
         conns += connect(bitcoindmgr.get(), &BitcoinDMgr::coinDetected, this, &Controller::on_coinDetected,
@@ -124,7 +124,35 @@ void Controller::startup()
                 lostConn = false;
                 stopTimer(waitTimer);
                 DebugM("Auth recvd from bicoind with id: ", id, ", proceeding with processing ...");
-                callOnTimerSoonNoRepeat(smallDelay, callProcessTimer, [this]{process();}, true);
+
+                auto proceedToProcess = [this] { callOnTimerSoonNoRepeat(smallDelay, callProcessTimer, [this]{process();}, true); };
+
+                // Once per process lifetime (not on every reconnect), verify our on-disk headers against bitcoind
+                // via batched RPC before proceeding -- see HeaderConsistencyChecker.h for why this replaces a full
+                // local re-verification.
+                if (!headersVerifiedAgainstDaemon && !headerConsistencyChecker) {
+                    headerConsistencyChecker = std::make_unique<HeaderConsistencyChecker>(*storage, options->bdRPCInfo, this);
+                    headerConsistencyChecker->start([this, proceedToProcess](HeaderConsistencyChecker::Result res) {
+                        headersVerifiedAgainstDaemon = true;
+                        // Defer destruction to the next event loop iteration rather than resetting synchronously
+                        // here: we are still inside a call stack that originates from a signal emitted by a
+                        // QNetworkReply owned by headerConsistencyChecker's QNetworkAccessManager. Destroying the
+                        // manager aborts any outstanding replies, which would destroy that very reply out from
+                        // under its own still-executing finished() handler -- undefined behavior.
+                        callOnTimerSoonNoRepeat(0, "destroyHeaderConsistencyChecker", [this]{ headerConsistencyChecker.reset(); });
+                        if (!res.ok) {
+                            Warning() << "Could not verify headers against yentend (" << res.errorString
+                                      << ") -- proceeding without full verification";
+                        } else if (res.mismatchHeight >= 0) {
+                            onHeaderMismatchDetected(unsigned(res.mismatchHeight));
+                        } else {
+                            Log() << "Headers verified OK against yentend";
+                        }
+                        proceedToProcess();
+                    });
+                } else {
+                    proceedToProcess();
+                }
 
                 // also (re)start the zmq notifier(s) if we had any before and bitcoind came back (but only if we are
                 // "ready" and able to serve connections)
@@ -166,7 +194,7 @@ void Controller::startup()
             auto now = Util::getTimeSecs();
             if (now-last >= 1.0) { // throttled to not spam log
                 last = now;
-                Log() << "bitcoind is still warming up: " << msg;
+                Log() << "yentend is still warming up: " << msg;
             }
         });
 
@@ -424,7 +452,7 @@ void GetChainInfoTask::process()
                 // This may happen if for some reason bitcoind omits this info or there is a parse error.
                 // We rely on this field being >= info.blocks in later code so just enforce that invariant now.
                 info.headers = info.blocks;
-                DebugM("bitcoind did not return the expected headers field, expected headers >= blocks (headers=",
+                DebugM("yentend did not return the expected headers field, expected headers >= blocks (headers=",
                        map.value("headers").toString(), ", blocks=", info.blocks, ")");
             }
 
@@ -1099,7 +1127,7 @@ void Controller::process(bool beSilentIfUpToDate)
             // generally a bad idea anyway to begin a synch without knowing if we are on BTC and/or LTC (SegWit and/or
             // MWEB extensions on deser, etc), then it's better to try again later after bitcoind tells us definitively
             // what coin we are on. Note that this branch is extremely unlikely and is only here for paranoia.
-            Warning() << "This instance has not yet received any information from bitcoind as to what coin we are"
+            Warning() << "This instance has not yet received any information from yentend as to what coin we are"
                          " on, aborting synch task (will retry later) ...";
             bitcoindmgr->requestBitcoinDInfoRefresh(); // give bitcoind a nudge and issue the RPC again
             genericTaskErrored();
@@ -1127,8 +1155,8 @@ void Controller::process(bool beSilentIfUpToDate)
             if (const auto hashDaemon = bitcoindmgr->getBitcoinDGenesisHash(), hashDb = storage->genesisHash();
                     !hashDb.isEmpty() && !hashDaemon.isEmpty() && hashDb != hashDaemon) {
                 Fatal() << "Bitcoind reports genesis hash: \"" << hashDaemon.toHex() << "\", which differs from our "
-                        << "database: \"" << hashDb.toHex() << "\". You may have connected to the wrong bitcoind. "
-                        << "To fix this issue either connect to a different bitcoind or delete this program's datadir "
+                        << "database: \"" << hashDb.toHex() << "\". You may have connected to the wrong yentend. "
+                        << "To fix this issue either connect to a different yentend or delete this program's datadir "
                         << "to resynch.";
                 return;
             }
@@ -1141,9 +1169,9 @@ void Controller::process(bool beSilentIfUpToDate)
             if (const auto dbchain = storage->getChain();
                     dbchain != normalizedChain && !normalizedChain.isEmpty() && net != BTC::Net::Invalid) {
                 if (!dbchain.isEmpty()) {
-                    Warning() << "Database had chain \"" << dbchain << "\", but bitcoind reports chain \"" << normalizedChain
+                    Warning() << "Database had chain \"" << dbchain << "\", but yentend reports chain \"" << normalizedChain
                               << "\".  Persisting \"" << normalizedChain << "\" to database.  Please ensure that you"
-                              << " are connected to the correct bitcoind instance!";
+                              << " are connected to the correct yentend instance!";
                 }
                 // save the normalized chain to the db, if we were able to grok it. Older versions of Fulcrum
                 // will expect to see it in the DB since they use it to check sanity.  Newer versions >= 1.2.7
@@ -1188,13 +1216,13 @@ void Controller::process(bool beSilentIfUpToDate)
                     }
                 } else {
                     // height ok, but best block hash mismatch.. reorg
-                    Warning() << "We have bestBlock " << tipHash.toHex() << ", but bitcoind reports bestBlock " << task->info.bestBlockhash.toHex() << "."
+                    Warning() << "We have bestBlock " << tipHash.toHex() << ", but yentend reports bestBlock " << task->info.bestBlockhash.toHex() << "."
                               << " Possible reorg, will rewind back 1 block and try again ...";
                     process_DoUndoAndRetry(); // attempt to undo 1 block and try again.
                     return;
                 }
             } else if (tip > sm->ht) {
-                Warning() << "We have height " << tip << ", but bitcoind reports height " << sm->ht << "."
+                Warning() << "We have height " << tip << ", but yentend reports height " << sm->ht << "."
                           << " Possible reorg, will rewind back 1 block and try again ...";
                 process_DoUndoAndRetry(); // attempt to undo 1 block and try again.
                 return;
@@ -1285,12 +1313,12 @@ void Controller::process(bool beSilentIfUpToDate)
         }
         if (tooFast) {
             // the task was too quick -- we need to cool off and let bitcoind get more blocks before proceeding
-            DebugM("bitcoind is in IBD, cooldown for ", tooFastThresh, " ", Util::Pluralize("second", tooFastThresh),
+            DebugM("yentend is in IBD, cooldown for ", tooFastThresh, " ", Util::Pluralize("second", tooFastThresh),
                    " to allow it to get more blocks ...");
             enablePollTimer = true;
             polltimeout = int(tooFastThresh * 1000);
         } else {
-            DebugM("bitcoind is in IBD, continuing to fetch blocks ...");
+            DebugM("yentend is in IBD, continuing to fetch blocks ...");
             AGAIN();
         }
     } else if (sm->state == State::Failure) {
@@ -1309,7 +1337,7 @@ void Controller::process(bool beSilentIfUpToDate)
                 // not our latest tip. Just to be sure, schedule us to run again immediately.
                 polltimeout = 0;
                 DebugM("zmq hashblock received with a (possibly) new header while we were synching, re-scheduling"
-                       " another bitcoind update immediately ...");
+                       " another yentend update immediately ...");
             } else
                 DebugM("zmq hashblock received while we were synching, however it matches our latest tip, ignoring ...");
         } else if (!sm->mostRecentZmqHashTxNotif.isEmpty()) {
@@ -1318,7 +1346,7 @@ void Controller::process(bool beSilentIfUpToDate)
                 // maybe have not yet seen. Just to be sure, schedule us to run again immediately.
                 polltimeout = 0;
                 DebugM("zmq hashtx received with a (possibly) new txn while we were synching, re-scheduling"
-                       " another bitcoind update immediately ...");
+                       " another yentend update immediately ...");
             } else
                 DebugM("zmq hashtx received while we were synching, however we have seen the txn already recently, ignoring ...");
         }
@@ -1333,7 +1361,7 @@ void Controller::process(bool beSilentIfUpToDate)
             sm.reset();  // great success!
         }
         enablePollTimer = true;
-        Warning() << "bitcoind is still downloading headers, will try again in 5 seconds";
+        Warning() << "yentend is still downloading headers, will try again in 5 seconds";
         polltimeout = 5 * 1000; // try again every 5 seconds
         emit synchFailure();
     } else if (sm->state == State::SynchMempool) {
@@ -1626,6 +1654,43 @@ void Controller::process_DoUndoAndRetry()
         Fatal() << "Failed to rewind: " << e.what() << inconsistentStateSorry;
         sm->state = StateMachine::State::Failure;
         // upon return to event loop, will shut down
+    }
+}
+
+void Controller::onHeaderMismatchDetected(unsigned mismatchHeight)
+{
+    const auto tipOpt = storage->latestHeight();
+    if (!tipOpt || mismatchHeight > *tipOpt) {
+        // Should not be possible: HeaderConsistencyChecker only checks heights up to our own tip as it was when the
+        // check started. Fail closed rather than guess.
+        Fatal() << "Header consistency check reported a mismatch at height " << mismatchHeight
+                << ", which is inconsistent with our own chain tip." << inconsistentStateSorry;
+        return;
+    }
+    const unsigned tip = *tipOpt;
+    const unsigned blocksToUndo = tip - mismatchHeight + 1;
+    const unsigned undoDepth = storage->configuredUndoDepth();
+    if (blocksToUndo > undoDepth) {
+        // A mismatch this deep cannot be a normal reorg (chain reorgs anywhere near this deep essentially never
+        // happen); it indicates our local data diverged from the real chain for some other reason (corruption).
+        // We don't have undo info that far back to safely unwind derived state (UTXOs, tx index, etc.), so -- same
+        // as the old full local-verification code did when it found any inconsistency -- we ask for a full resync
+        // rather than attempt a risky partial recovery.
+        Fatal() << "Header consistency check detected a mismatch vs. yentend at height " << mismatchHeight
+                << ", " << blocksToUndo << " blocks back from our tip (" << tip << ") -- beyond our " << undoDepth
+                << "-block undo depth. This indicates local database corruption rather than a normal reorg."
+                << inconsistentStateSorry;
+        return;
+    }
+    Log() << "Header consistency check detected a mismatch vs. yentend at height " << mismatchHeight
+          << " (likely a reorg that happened while we were offline) -- rewinding " << blocksToUndo << " "
+          << Util::Pluralize("block", blocksToUndo) << " ...";
+    try {
+        for (unsigned i = 0; i < blocksToUndo; ++i)
+            storage->undoLatestBlock(false);
+        Log() << "Rewound to height " << storage->latestHeight().value_or(-1) << "; will re-sync from there.";
+    } catch (const std::exception &e) {
+        Fatal() << "Failed to rewind after header mismatch: " << e.what() << inconsistentStateSorry;
     }
 }
 

@@ -2711,46 +2711,40 @@ void Storage::loadCheckHeadersInDB()
     assert(p->blockHeaderSize() > 0);
     assert(bool(p->db.headersDRA));
 
-    Log() << "Verifying headers ...";
-    uint32_t num = static_cast<uint32_t>(p->db.headersDRA->numRecords());
-    std::vector<QByteArray> hVec;
-    const Tic t0;
-    {
-        if (num > MAX_HEADERS)
-            throw DatabaseFormatError(QString("Header count (%1) in database exceeds MAX_HEADERS (%2)! This is likely due to"
-                                              " a database format mistmatch. Delete the datadir and resynch it.")
-                                          .arg(num).arg(MAX_HEADERS));
-        // verify headers: hashPrevBlock must match what we actually read from db
-        if (num) {
-            Debug() << "Verifying " << num << " " << Util::Pluralize("header", num) << " ...";
-            QString err;
-            hVec = headersFromHeight_nolock_nocheck(0, num, &err);
-            if (!err.isEmpty() || hVec.size() != num)
-                throw DatabaseFormatError(QString("%1. Possible databaase corruption. Delete the datadir and resynch.").arg(err.isEmpty() ? "Could not read all headers" : err));
+    const uint32_t num = static_cast<uint32_t>(p->db.headersDRA->numRecords());
 
-            auto [verif, lock] = headerVerifier();
-            // set genesis hash -- use GetHash() so YTN uses RinHash, not SHA256d
-            p->genesisHash = BTC::HeaderHash(hVec.front());
+    if (num > MAX_HEADERS)
+        throw DatabaseFormatError(QString("Header count (%1) in database exceeds MAX_HEADERS (%2)! This is likely due to"
+                                          " a database format mistmatch. Delete the datadir and resynch it.")
+                                      .arg(num).arg(MAX_HEADERS));
 
-            err.clear();
-            // read db
-            for (uint32_t i = 0; i < num; ++i) {
-                auto & bytes = hVec[i];
-                if (!verif(bytes, &err))
-                    throw DatabaseFormatError(QString("%1. Possible databaase corruption. Delete the datadir and resynch.").arg(err));
-                bytes = BTC::Hash(bytes); // replace the header in the vector with its hash because it will be needed below...
-            }
-        }
-    }
+    // Note: we deliberately do NOT re-verify the full header chain (hashPrevBlock linkage) here anymore, nor do we
+    // recompute each header's hash. For coins with a cheap header hash that used to be essentially free even for
+    // millions of headers, but for coins like YTN whose pre-fork header hash is a deliberately memory-hard/slow PoW
+    // function (Yespower), doing so unconditionally on every startup could take well over an hour, single-threaded,
+    // before any listener even opens -- and it only ever validated our own on-disk self-consistency, not whether our
+    // data actually matches the real chain. Instead, Controller kicks off a HeaderConsistencyChecker once bitcoind
+    // is connected, which verifies our stored headers against the daemon's own data via cheap batched RPC calls --
+    // see HeaderConsistencyChecker.h for the full rationale. Here we just cheaply seed the bits that are needed
+    // immediately: the genesis hash, and the in-memory HeaderVerifier state for the *next* newly-appended header.
     if (num) {
-        if (const auto mops = p->db.concatOperatorHeaders->merges.load(); mops)
-            Debug() << CFName(p->db.headers) << " merge ops: " << mops;
-        Debug() << "Read & verified " << num << " " << Util::Pluralize("header", num) << " from db in " << t0.msecStr() << " msec";
+        QString err;
+        const auto genesisVec = headersFromHeight_nolock_nocheck(0, 1, &err);
+        if (!err.isEmpty() || genesisVec.size() != 1)
+            throw DatabaseFormatError(QString("%1. Possible database corruption. Delete the datadir and resynch.").arg(err.isEmpty() ? "Could not read genesis header" : err));
+        p->genesisHash = BTC::HeaderHash(genesisVec.front());
+
+        err.clear();
+        const auto tipVec = headersFromHeight_nolock_nocheck(num - 1, 1, &err);
+        if (!err.isEmpty() || tipVec.size() != 1)
+            throw DatabaseFormatError(QString("%1. Possible database corruption. Delete the datadir and resynch.").arg(err.isEmpty() ? "Could not read tip header" : err));
+        auto [verif, lock] = headerVerifier();
+        verif.reset(num, tipVec.front()); // seed verifier so the *next* newly-appended header is checked against our tip
     }
 
-    if (!p->merkleCache->isInitialized() && !hVec.empty())
-        p->merkleCache->initialize(hVec); // this may take a few seconds, and it may also throw
-
+    // Deliberately leave the merkle cache uninitialized here, same as we already do for a brand new/empty DB -- it
+    // gets lazily built by Controller::updateMerkleCache() once bitcoind reports us as up-to-date, which avoids
+    // hashing the entire history a second time just to warm a cache most restarts won't need.
 }
 
 void Storage::loadCheckTxNumsDRAAndBlkInfo()
